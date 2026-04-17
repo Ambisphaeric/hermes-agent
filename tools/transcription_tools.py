@@ -32,6 +32,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Optional, Dict, Any
 from urllib.parse import urljoin
@@ -74,9 +75,115 @@ _HAS_FASTER_WHISPER = _safe_find_spec("faster_whisper")
 _HAS_OPENAI = _safe_find_spec("openai")
 _HAS_MISTRAL = _safe_find_spec("mistralai")
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# HTTP STT Override (optional - for external/local HTTP STT servers)
+# ===========================================================================
+
+STT_HTTP_URL_ENV = "STT_HTTP_URL"
+STT_HTTP_TIMEOUT_ENV = "STT_HTTP_TIMEOUT"
+DEFAULT_STT_HTTP_TIMEOUT = 60
+
+
+def _get_http_stt_config() -> Optional[Dict[str, Any]]:
+    """Check if HTTP STT override is configured via env vars.
+    
+    Returns dict with url/timeout if STT_HTTP_URL is set, else None.
+    """
+    http_url = os.getenv(STT_HTTP_URL_ENV)
+    if not http_url:
+        return None
+    
+    return {
+        "url": http_url,
+        "timeout": int(os.getenv(STT_HTTP_TIMEOUT_ENV, DEFAULT_STT_HTTP_TIMEOUT)),
+    }
+
+
+def _transcribe_http(file_path: str, config: Dict[str, Any]) -> Dict[str, Any]:
+    """Transcribe via HTTP POST to external STT server.
+    
+    Works with any OpenAI-compatible STT HTTP endpoint.
+    Uses multipart/form-data for file upload (compatible with Whisper API).
+    """
+    import urllib.request
+    import json
+    import mimetypes
+    
+    url = config["url"]
+    timeout = config["timeout"]
+    
+    try:
+        # Build multipart/form-data request (OpenAI Whisper compatible)
+        boundary = '----HermesBoundary' + str(int(time.time() * 1000))
+        
+        # Read audio file
+        with open(file_path, 'rb') as f:
+            audio_data = f.read()
+        
+        # Determine content type
+        content_type = mimetypes.guess_type(file_path)[0] or 'audio/wav'
+        filename = Path(file_path).name
+        
+        # Build multipart body
+        # Field: file
+        body = b'------' + boundary.encode() + b'\r\n'
+        body += f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'.encode()
+        body += f'Content-Type: {content_type}\r\n\r\n'.encode()
+        body += audio_data + b'\r\n'
+        
+        # Field: model (required by OpenAI API)
+        body += b'------' + boundary.encode() + b'\r\n'
+        body += b'Content-Disposition: form-data; name="model"\r\n\r\n'
+        body += b'whisper-1\r\n'
+        
+        # End boundary
+        body += b'------' + boundary.encode() + b'--\r\n'
+        
+        req = urllib.request.Request(
+            url,
+            data=body,
+            headers={
+                'Content-Type': f'multipart/form-data; boundary=----{boundary}',
+                'Content-Length': str(len(body))
+            },
+            method='POST'
+        )
+        
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            if response.status != 200:
+                return {
+                    "success": False,
+                    "transcript": "",
+                    "error": f"HTTP STT failed: {response.status}"
+                }
+            
+            result = response.read().decode('utf-8')
+            
+            # Try to parse as JSON (OpenAI-compatible response)
+            try:
+                json_result = json.loads(result)
+                if isinstance(json_result, dict):
+                    transcript = json_result.get("text", "")
+                else:
+                    transcript = str(result).strip()
+            except json.JSONDecodeError:
+                transcript = str(result).strip()
+            
+            logger.info(
+                "Transcribed %s via HTTP STT (%s, %d chars)",
+                Path(file_path).name, url, len(transcript)
+            )
+            
+            return {"success": True, "transcript": transcript, "provider": "http"}
+    
+    except Exception as e:
+        logger.error("HTTP transcription failed: %s", e, exc_info=True)
+        return {"success": False, "transcript": "", "error": f"HTTP transcription failed: {e}"}
+
+
+# ===========================================================================
 # Constants
-# ---------------------------------------------------------------------------
+# ===========================================================================
 
 DEFAULT_PROVIDER = "local"
 DEFAULT_LOCAL_MODEL = "base"
@@ -822,6 +929,11 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
     provider = _get_provider(stt_config)
 
     if provider == "local":
+        # Check for HTTP override first (external/local HTTP server)
+        http_config = _get_http_stt_config()
+        if http_config:
+            logger.info("Transcribing via HTTP STT (%s)...", http_config["url"])
+            return _transcribe_http(file_path, http_config)
         local_cfg = stt_config.get("local", {})
         model_name = _normalize_local_model(
             model or local_cfg.get("model", DEFAULT_LOCAL_MODEL)
@@ -829,6 +941,11 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
         return _transcribe_local(file_path, model_name)
 
     if provider == "local_command":
+        # Check for HTTP override first (external/local HTTP server)
+        http_config = _get_http_stt_config()
+        if http_config:
+            logger.info("Transcribing via HTTP STT (%s)...", http_config["url"])
+            return _transcribe_http(file_path, http_config)
         local_cfg = stt_config.get("local", {})
         model_name = _normalize_local_command_model(
             model or local_cfg.get("model", DEFAULT_LOCAL_MODEL)
@@ -861,6 +978,7 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
         "error": (
             "No STT provider available. Install faster-whisper for free local "
             f"transcription, configure {LOCAL_STT_COMMAND_ENV} or install a local whisper CLI, "
+            f"set {STT_HTTP_URL_ENV} to use an external HTTP STT server, "
             "set GROQ_API_KEY for free Groq Whisper, set MISTRAL_API_KEY for Mistral "
             "Voxtral Transcribe, set XAI_API_KEY for xAI Grok STT, or set VOICE_TOOLS_OPENAI_KEY "
             "or OPENAI_API_KEY for the OpenAI Whisper API."

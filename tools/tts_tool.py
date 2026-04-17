@@ -1219,6 +1219,66 @@ def _generate_gemini_tts(text: str, output_path: str, tts_config: Dict[str, Any]
 
 
 # ===========================================================================
+# HTTP TTS Override (optional - for external/local HTTP TTS servers)
+# ===========================================================================
+
+def _get_http_tts_config() -> Optional[Dict[str, Any]]:
+    """Check if HTTP TTS override is configured via env vars.
+    
+    Returns dict with url/voice/speed if TTS_HTTP_URL is set, else None.
+    """
+    http_url = os.getenv("TTS_HTTP_URL")
+    if not http_url:
+        return None
+    
+    return {
+        "url": http_url,
+        "voice": os.getenv("TTS_HTTP_VOICE", "af_bella"),
+        "speed": float(os.getenv("TTS_HTTP_SPEED", "0.75")),
+        "timeout": int(os.getenv("TTS_HTTP_TIMEOUT", "30")),
+    }
+
+
+def _generate_http_tts(text: str, output_path: str, config: Dict[str, Any]) -> str:
+    """Generate speech via HTTP POST to external TTS server.
+    
+    Works with any HTTP-compatible TTS server (Kokoro-MLX, etc).
+    """
+    import urllib.request
+    import urllib.parse
+    
+    url = config["url"]
+    voice = config["voice"]
+    speed = config["speed"]
+    timeout = config["timeout"]
+    
+    logger.info("HTTP TTS request: voice=%s speed=%.2f text=%.50s...", voice, speed, text)
+    
+    # Build POST data
+    data = urllib.parse.urlencode({
+        "text": text,
+        "voice": voice,
+        "speed": str(speed),
+    }).encode('utf-8')
+    
+    headers = {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Length': str(len(data))
+    }
+    
+    req = urllib.request.Request(url, data=data, headers=headers, method='POST')
+    
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        if response.status != 200:
+            raise RuntimeError(f"HTTP TTS failed: {response.status}")
+        audio_data = response.read()
+        with open(output_path, 'wb') as f:
+            f.write(audio_data)
+    
+    return output_path
+
+
+# ===========================================================================
 # NeuTTS (local, on-device TTS via neutts_cli)
 # ===========================================================================
 
@@ -1610,8 +1670,14 @@ def text_to_speech_tool(
     file_str = str(file_path)
 
     try:
+        # Check for HTTP TTS override FIRST (highest priority - env var override)
+        http_config = _get_http_tts_config()
+        if http_config:
+            logger.info("Generating speech via HTTP TTS (%s, voice=%s)...", http_config["url"], http_config["voice"])
+            _generate_http_tts(text, file_str, http_config)
+        
         # Generate audio with the configured provider
-        if command_provider_config is not None:
+        elif command_provider_config is not None:
             logger.info(
                 "Generating speech with command TTS provider '%s'...", provider,
             )
@@ -1670,10 +1736,12 @@ def text_to_speech_tool(
                 return json.dumps({
                     "success": False,
                     "error": "NeuTTS provider selected but neutts is not installed. "
-                             "Run hermes setup and choose NeuTTS, or install espeak-ng and run python -m pip install -U neutts[all]."
+                             "Run hermes setup and choose NeuTTS, or install espeak-ng and run python -m pip install -U neutts[all]. "
+                             "Alternatively, set TTS_HTTP_URL to use an external HTTP TTS server."
                 }, ensure_ascii=False)
-            logger.info("Generating speech with NeuTTS (local)...")
-            _generate_neutts(text, file_str, tts_config)
+            else:
+                logger.info("Generating speech with NeuTTS (local)...")
+                _generate_neutts(text, file_str, tts_config)
 
         elif provider == "kittentts":
             try:
