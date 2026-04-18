@@ -1224,57 +1224,80 @@ def _generate_gemini_tts(text: str, output_path: str, tts_config: Dict[str, Any]
 
 def _get_http_tts_config() -> Optional[Dict[str, Any]]:
     """Check if HTTP TTS override is configured via env vars.
-    
-    Returns dict with url/voice/speed if TTS_HTTP_URL is set, else None.
+
+    Returns dict with url/voice/speed/model if TTS_HTTP_URL is set, else None.
     """
     http_url = os.getenv("TTS_HTTP_URL")
     if not http_url:
         return None
-    
+
     return {
         "url": http_url,
         "voice": os.getenv("TTS_HTTP_VOICE", "af_bella"),
         "speed": float(os.getenv("TTS_HTTP_SPEED", "0.75")),
         "timeout": int(os.getenv("TTS_HTTP_TIMEOUT", "30")),
+        "model": os.getenv("TTS_HTTP_MODEL", "mlx-community/Kokoro-82M-bf16"),
     }
 
 
 def _generate_http_tts(text: str, output_path: str, config: Dict[str, Any]) -> str:
     """Generate speech via HTTP POST to external TTS server.
-    
+
     Works with any HTTP-compatible TTS server (Kokoro-MLX, etc).
+    Auto-detects OpenAI-compatible endpoints (/v1/audio/speech) and uses JSON format.
+    Legacy form-urlencoded is used for other endpoints (/tts, etc).
     """
     import urllib.request
     import urllib.parse
-    
+    import json
+
     url = config["url"]
     voice = config["voice"]
     speed = config["speed"]
     timeout = config["timeout"]
-    
-    logger.info("HTTP TTS request: voice=%s speed=%.2f text=%.50s...", voice, speed, text)
-    
-    # Build POST data
-    data = urllib.parse.urlencode({
-        "text": text,
-        "voice": voice,
-        "speed": str(speed),
-    }).encode('utf-8')
-    
-    headers = {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'Content-Length': str(len(data))
-    }
-    
+
+    # Detect OpenAI-compatible endpoint
+    is_openai_compatible = "/v1/audio/speech" in url
+
+    logger.info("HTTP TTS request: url=%s voice=%s speed=%.2f openai_compat=%s",
+                url, voice, speed, is_openai_compatible)
+
+    if is_openai_compatible:
+        # OpenAI-compatible JSON format (mlx-audio unified server, etc)
+        model = config.get("model", "mlx-community/Kokoro-82M-bf16")
+        payload = {
+            "model": model,
+            "input": text,
+            "voice": voice,
+            "speed": speed,
+            "response_format": "wav",
+        }
+        data = json.dumps(payload).encode('utf-8')
+        headers = {
+            'Content-Type': 'application/json',
+            'Content-Length': str(len(data))
+        }
+    else:
+        # Legacy form-urlencoded format (original /tts endpoints)
+        data = urllib.parse.urlencode({
+            "text": text,
+            "voice": voice,
+            "speed": str(speed),
+        }).encode('utf-8')
+        headers = {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Content-Length': str(len(data))
+        }
+
     req = urllib.request.Request(url, data=data, headers=headers, method='POST')
-    
+
     with urllib.request.urlopen(req, timeout=timeout) as response:
         if response.status != 200:
             raise RuntimeError(f"HTTP TTS failed: {response.status}")
         audio_data = response.read()
         with open(output_path, 'wb') as f:
             f.write(audio_data)
-    
+
     return output_path
 
 
@@ -1674,7 +1697,26 @@ def text_to_speech_tool(
         http_config = _get_http_tts_config()
         if http_config:
             logger.info("Generating speech via HTTP TTS (%s, voice=%s)...", http_config["url"], http_config["voice"])
-            _generate_http_tts(text, file_str, http_config)
+            # HTTP TTS (OpenAI-compatible) returns WAV audio - ensure we use .wav extension
+            # If the caller requested .mp3/.ogg, we'll write WAV then convert if needed
+            is_openai_compatible = "/v1/audio/speech" in http_config["url"]
+            if is_openai_compatible and not file_str.endswith(".wav"):
+                wav_path = file_str.rsplit(".", 1)[0] + ".wav"
+                _generate_http_tts(text, wav_path, http_config)
+                # Convert to requested format if ffmpeg available
+                if file_str != wav_path:
+                    ffmpeg = shutil.which("ffmpeg")
+                    if ffmpeg:
+                        conv_cmd = [ffmpeg, "-i", wav_path, "-y", "-loglevel", "error", file_str]
+                        subprocess.run(conv_cmd, check=True, timeout=30)
+                        os.remove(wav_path)
+                    else:
+                        # No ffmpeg - rename WAV to expected path
+                        os.rename(wav_path, file_str)
+                # Update file_str for return value
+                file_str = file_str if ffmpeg and file_str != wav_path else (wav_path if not ffmpeg else file_str)
+            else:
+                _generate_http_tts(text, file_str, http_config)
         
         # Generate audio with the configured provider
         elif command_provider_config is not None:

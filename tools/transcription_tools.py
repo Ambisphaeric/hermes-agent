@@ -81,64 +81,90 @@ _HAS_MISTRAL = _safe_find_spec("mistralai")
 
 STT_HTTP_URL_ENV = "STT_HTTP_URL"
 STT_HTTP_TIMEOUT_ENV = "STT_HTTP_TIMEOUT"
+STT_HTTP_MODEL_ENV = "STT_HTTP_MODEL"
 DEFAULT_STT_HTTP_TIMEOUT = 60
+DEFAULT_STT_HTTP_MODEL = "whisper-1"
 
 
 def _get_http_stt_config() -> Optional[Dict[str, Any]]:
     """Check if HTTP STT override is configured via env vars.
-    
-    Returns dict with url/timeout if STT_HTTP_URL is set, else None.
+
+    Returns dict with url/timeout/model if STT_HTTP_URL is set, else None.
     """
     http_url = os.getenv(STT_HTTP_URL_ENV)
     if not http_url:
         return None
-    
+
     return {
         "url": http_url,
         "timeout": int(os.getenv(STT_HTTP_TIMEOUT_ENV, DEFAULT_STT_HTTP_TIMEOUT)),
+        "model": os.getenv(STT_HTTP_MODEL_ENV, DEFAULT_STT_HTTP_MODEL),
     }
 
 
 def _transcribe_http(file_path: str, config: Dict[str, Any]) -> Dict[str, Any]:
     """Transcribe via HTTP POST to external STT server.
-    
+
     Works with any OpenAI-compatible STT HTTP endpoint.
     Uses multipart/form-data for file upload (compatible with Whisper API).
+    Auto-converts non-WAV files to WAV if ffmpeg is available.
     """
     import urllib.request
     import json
     import mimetypes
-    
+    import tempfile
+
     url = config["url"]
     timeout = config["timeout"]
-    
+    model = config.get("model", DEFAULT_STT_HTTP_MODEL)
+
+    # Auto-convert to WAV if needed (many STT servers require WAV)
+    wav_path = None
+    if not file_path.lower().endswith('.wav'):
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg:
+            try:
+                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmp:
+                    wav_path = tmp.name
+                conv_cmd = [
+                    ffmpeg, '-y', '-loglevel', 'error',
+                    '-i', file_path,
+                    '-ar', '16000', '-ac', '1',  # 16kHz mono
+                    wav_path
+                ]
+                subprocess.run(conv_cmd, check=True, timeout=30)
+                file_path = wav_path
+            except Exception as e:
+                logger.warning("Failed to convert audio to WAV: %s", e)
+                # Continue with original file
+
     try:
         # Build multipart/form-data request (OpenAI Whisper compatible)
         boundary = '----HermesBoundary' + str(int(time.time() * 1000))
-        
+
         # Read audio file
         with open(file_path, 'rb') as f:
             audio_data = f.read()
-        
+
         # Determine content type
         content_type = mimetypes.guess_type(file_path)[0] or 'audio/wav'
         filename = Path(file_path).name
-        
+
         # Build multipart body
         # Field: file
         body = b'------' + boundary.encode() + b'\r\n'
         body += f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'.encode()
         body += f'Content-Type: {content_type}\r\n\r\n'.encode()
         body += audio_data + b'\r\n'
-        
+
         # Field: model (required by OpenAI API)
         body += b'------' + boundary.encode() + b'\r\n'
         body += b'Content-Disposition: form-data; name="model"\r\n\r\n'
-        body += b'whisper-1\r\n'
-        
+        body += model.encode('utf-8') + b'\r\n'
+
         # End boundary
         body += b'------' + boundary.encode() + b'--\r\n'
-        
+
         req = urllib.request.Request(
             url,
             data=body,
@@ -148,7 +174,7 @@ def _transcribe_http(file_path: str, config: Dict[str, Any]) -> Dict[str, Any]:
             },
             method='POST'
         )
-        
+
         with urllib.request.urlopen(req, timeout=timeout) as response:
             if response.status != 200:
                 return {
@@ -156,9 +182,9 @@ def _transcribe_http(file_path: str, config: Dict[str, Any]) -> Dict[str, Any]:
                     "transcript": "",
                     "error": f"HTTP STT failed: {response.status}"
                 }
-            
+
             result = response.read().decode('utf-8')
-            
+
             # Try to parse as JSON (OpenAI-compatible response)
             try:
                 json_result = json.loads(result)
@@ -168,17 +194,24 @@ def _transcribe_http(file_path: str, config: Dict[str, Any]) -> Dict[str, Any]:
                     transcript = str(result).strip()
             except json.JSONDecodeError:
                 transcript = str(result).strip()
-            
+
             logger.info(
                 "Transcribed %s via HTTP STT (%s, %d chars)",
                 Path(file_path).name, url, len(transcript)
             )
-            
+
             return {"success": True, "transcript": transcript, "provider": "http"}
-    
+
     except Exception as e:
         logger.error("HTTP transcription failed: %s", e, exc_info=True)
         return {"success": False, "transcript": "", "error": f"HTTP transcription failed: {e}"}
+    finally:
+        # Cleanup temp WAV file if we created one
+        if wav_path and os.path.exists(wav_path):
+            try:
+                os.unlink(wav_path)
+            except OSError:
+                pass
 
 
 # ===========================================================================
