@@ -1,6 +1,7 @@
 """Tests for DingTalk platform adapter."""
 import asyncio
 import json
+import sys
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
@@ -751,8 +752,37 @@ class TestMessageContextIsolation:
 class TestCardLifecycle:
 
     @pytest.fixture
-    def adapter_with_card(self):
+    def adapter_with_card(self, monkeypatch):
         from gateway.platforms.dingtalk import DingTalkAdapter
+        import gateway.platforms.dingtalk as dingtalk_module
+
+        # Mock tea_util_models and dingtalk_card_models to avoid import issues
+        mock_tea_util = MagicMock()
+        mock_tea_util.RuntimeOptions.return_value = MagicMock()
+        monkeypatch.setattr(dingtalk_module, "tea_util_models", mock_tea_util)
+
+        mock_card_models = MagicMock()
+        mock_card_models.CreateCardRequest.return_value = MagicMock()
+        mock_card_models.CreateCardRequestCardData.return_value = MagicMock()
+        mock_card_models.CreateCardRequestImGroupOpenSpaceModel.return_value = MagicMock()
+        mock_card_models.CreateCardRequestImRobotOpenSpaceModel.return_value = MagicMock()
+
+        # Configure StreamingUpdateRequest to set is_finalize based on call context
+        # is_finalize=True when called with reply_to (final response), False otherwise
+        def make_streaming_request(out_track_id, guid, key, content, is_full=True, is_finalize=False, is_error=False):
+            req = MagicMock()
+            req.out_track_id = out_track_id
+            req.guid = guid
+            req.key = key
+            req.content = content
+            req.is_full = is_full
+            req.is_finalize = is_finalize  # Capture the actual value passed
+            req.is_error = is_error
+            return req
+
+        mock_card_models.StreamingUpdateRequest.side_effect = make_streaming_request
+        monkeypatch.setattr(dingtalk_module, "dingtalk_card_models", mock_card_models)
+
         a = DingTalkAdapter(PlatformConfig(
             enabled=True,
             extra={"card_template_id": "tmpl-1"},
@@ -942,14 +972,44 @@ class TestDingTalkAdapterAICards:
         return msg
 
     @pytest.mark.asyncio
-    async def test_send_uses_ai_card_if_configured(self, config, mock_stream_client, mock_http_client, mock_message):
+    async def test_send_uses_ai_card_if_configured(self, config, mock_stream_client, mock_http_client, mock_message, monkeypatch):
         from gateway.platforms.dingtalk import DingTalkAdapter
+        import gateway.platforms.dingtalk as dingtalk_module
+
+        # Mock tea_util_models and dingtalk_card_models to avoid import issues
+        mock_tea_util = MagicMock()
+        mock_tea_util.RuntimeOptions.return_value = MagicMock()
+        monkeypatch.setattr(dingtalk_module, "tea_util_models", mock_tea_util)
+
+        mock_card_models = MagicMock()
+        mock_card_models.CreateCardRequest.return_value = MagicMock()
+        mock_card_models.CreateCardRequestCardData.return_value = MagicMock()
+        mock_card_models.CreateCardRequestImGroupOpenSpaceModel.return_value = MagicMock()
+        mock_card_models.CreateCardRequestImRobotOpenSpaceModel.return_value = MagicMock()
+        mock_card_models.DeliverCardRequest.return_value = MagicMock()
+        mock_card_models.DeliverCardHeaders.return_value = MagicMock()
+        mock_card_models.CreateCardHeaders.return_value = MagicMock()
+
+        def make_streaming_request(out_track_id, guid, key, content, is_full=True, is_finalize=False, is_error=False):
+            req = MagicMock()
+            req.out_track_id = out_track_id
+            req.guid = guid
+            req.key = key
+            req.content = content
+            req.is_full = is_full
+            req.is_finalize = is_finalize
+            req.is_error = is_error
+            return req
+
+        mock_card_models.StreamingUpdateRequest.side_effect = make_streaming_request
+        mock_card_models.StreamingUpdateHeaders.return_value = MagicMock()
+        monkeypatch.setattr(dingtalk_module, "dingtalk_card_models", mock_card_models)
 
         adapter = DingTalkAdapter(config)
         adapter._stream_client = mock_stream_client
         adapter._http_client = mock_http_client
         adapter._message_contexts["test_conv_id"] = mock_message
-        adapter._session_webhooks = {"test_conv_id": ("https://api.dingtalk.com/robot/sendBySession?session=test", 9999999999999)}
+        adapter._session_webhooks = {"test_conv_id": ("https://api.dingtalk.com/robot/sendBySession?session=***", 9999999999999)}
         adapter._card_template_id = "test_card_template"
 
         # Mock the card SDK with proper async methods
